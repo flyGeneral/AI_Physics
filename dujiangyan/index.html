@@ -94,6 +94,7 @@
   <label class="check"><input type="checkbox" id="labels" checked>结构标注</label>
   <label class="check"><input type="checkbox" id="mud" checked>浑水着色（底层含沙）</label>
   <label class="check"><input type="checkbox" id="section" checked>环流剖面（分沙原理）</label>
+  <label class="check"><input type="checkbox" id="arrows" checked>流向箭头（清水青 · 排沙橙）</label>
 
   <div class="btns">
     <button id="pauseBtn">暂停</button>
@@ -227,6 +228,25 @@ void main(){
   float a = uAlpha;
   if (uPulse > 0.5) a *= 0.22 + 0.78 * pow(0.5 + 0.5 * cos(vParam - uTime * 2.2), 3.0);
   gl_FragColor = vec4(vColor, a);
+}
+</script>
+
+<!-- ======================= 流向箭头着色器 ======================= -->
+<script id="vs-arrow" type="x-shader/x-vertex">
+attribute vec3 aPos;
+attribute vec4 aColor;
+uniform mat4 uMVP;
+varying vec4 vColor;
+void main(){
+  gl_Position = uMVP * vec4(aPos, 1.0);
+  vColor = aColor;
+}
+</script>
+<script id="fs-arrow" type="x-shader/x-fragment">
+precision mediump float;
+varying vec4 vColor;
+void main(){
+  gl_FragColor = vColor;
 }
 </script>
 
@@ -551,21 +571,23 @@ void main(){
     if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
     return prog;
   }
-  var progT, progP, progW, progS, UT = {}, UP = {}, UW = {}, US = {}, AT = {}, AP = {}, AS = {}, AW = {};
+  var progT, progP, progW, progS, progA, UT = {}, UP = {}, UW = {}, US = {}, UA = {}, AT = {}, AP = {}, AS = {}, AW = {}, AA = {};
   try {
     progT = makeProg('vs-terrain', 'fs-terrain');
     progP = makeProg('vs-points', 'fs-points');
     progW = makeProg('vs-water', 'fs-water');
     progS = makeProg('vs-section', 'fs-section');
+    progA = makeProg('vs-arrow', 'fs-arrow');
   } catch (e) { showError('着色器编译失败：\n' + e.message); return; }
   ['uMVP', 'uLight', 'uFog'].forEach(function (n) { UT[n] = gl.getUniformLocation(progT, n); });
   ['uMVP', 'uPtScale'].forEach(function (n) { UP[n] = gl.getUniformLocation(progP, n); });
   ['uMVP', 'uTime', 'uLift', 'uColor'].forEach(function (n) { UW[n] = gl.getUniformLocation(progW, n); });
   ['uMVP', 'uTime', 'uPulse', 'uAlpha'].forEach(function (n) { US[n] = gl.getUniformLocation(progS, n); });
+  ['uMVP'].forEach(function (n) { UA[n] = gl.getUniformLocation(progA, n); });
   ['aPos', 'aNormal', 'aColor'].forEach(function (n) { AT[n] = gl.getAttribLocation(progT, n); });
   ['aPos', 'aColor', 'aSize'].forEach(function (n) { AP[n] = gl.getAttribLocation(progP, n); });
   ['aPos', 'aColor', 'aParam'].forEach(function (n) { AS[n] = gl.getAttribLocation(progS, n); });
-  ['aPos', 'aColor', 'aSize'].forEach(function (n) { AP[n] = gl.getAttribLocation(progP, n); });
+  ['aPos', 'aColor'].forEach(function (n) { AA[n] = gl.getAttribLocation(progA, n); });
 
   // 地形网格
   var nVerts = TERR_N * TERR_N;
@@ -828,6 +850,88 @@ void main(){
         }
       }
     }
+  }
+
+  // ================= 流向箭头（贴水面顺流漂移） =================
+  // 表层流向一眼可辨：清水河段青色箭头，飞沙堰溢流段琥珀色（泥沙外排方向）。
+  // 箭头沿河道中心线以表层流速推进，箭身贴水面、随弯道切向转向。
+  var ARW_CONF = [
+    { r: R.up,       n: 9,  col: [0.62, 0.93, 1.00] },
+    { r: R.out,      n: 10, col: [0.62, 0.93, 1.00] },
+    { r: R.inn,      n: 9,  col: [0.62, 0.93, 1.00] },
+    { r: R.gate,     n: 4,  col: [0.80, 0.97, 1.00] },
+    { r: R.weirPath, n: 6,  col: [1.00, 0.84, 0.38], scale: 1.6 }
+  ];
+  R.fan.forEach(function (f) { ARW_CONF.push({ r: f, n: 3, col: [0.62, 0.93, 1.00] }); });
+  var ARW_N = ARW_CONF.reduce(function (s, c) { return s + c.n; }, 0);
+  var arwS = new Float32Array(ARW_N), arwXi = new Float32Array(ARW_N);
+  (function () {
+    var ai = 0;
+    ARW_CONF.forEach(function (c) {
+      for (var k = 0; k < c.n; k++) {
+        arwS[ai] = (k + Math.random() * 0.5) / c.n * c.r.len;
+        arwXi[ai] = (Math.random() * 2 - 1) * 0.6;
+        ai++;
+      }
+    });
+  })();
+  var arwVB = new Float32Array(ARW_N * 9 * 7);   // 每箭 9 顶点（箭身 6 + 箭头 3）× (pos3+col4)
+  var bArw = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, bArw);
+  gl.bufferData(gl.ARRAY_BUFFER, arwVB.byteLength, gl.DYNAMIC_DRAW);
+
+  function updateArrows(dt, qScale) {   // 只推进弧长位置，顶点由 buildArrows 统一生成
+    if (dt <= 0 || qScale <= 0) return;
+    var ai = 0;
+    ARW_CONF.forEach(function (c) {
+      var r = c.r;
+      for (var k = 0; k < c.n; k++, ai++) {
+        var p = r.posAt(arwS[ai]);
+        arwS[ai] += r.speedBase * (r.width0 / Math.max(p.w, 6)) * qScale * dt;   // 与表层粒子同速
+        if (arwS[ai] >= r.len) { arwS[ai] -= r.len; arwXi[ai] = (Math.random() * 2 - 1) * 0.6; }
+      }
+    });
+  }
+
+  function buildArrows() {
+    var lift = 0.3 + 0.5 * model.stage + 0.4;   // 水面亮带高度之上一点
+    var ai = 0, o = 0;
+    ARW_CONF.forEach(function (c) {
+      var r = c.r, col = c.col, sc = c.scale || 1;
+      for (var k = 0; k < c.n; k++, ai++) {
+        var p = r.posAt(arwS[ai]);
+        var px = p.x + p.nx * arwXi[ai] * p.w * 0.5;
+        var pz = p.z + p.nz * arwXi[ai] * p.w * 0.5;
+        var py = bedAt(px, pz) + lift;
+        if (r.kind === 'weir') py += 2.0 + 4.2 * Math.sin(Math.PI * Math.min(arwS[ai] / r.len, 1));  // 越堰水跃（抬高避开堰体）
+        var L = Math.min(17, Math.max(7, p.w * 0.26)) * sc;
+        var W = L * 0.16;
+        var fade = smooth(0, 0.07, p.t) * (1 - smooth(0.9, 1, p.t));
+        var tx = p.tx, tz = p.tz, nx = p.nx, nz = p.nz;
+        function pt(u, v) { return [px + tx * u + nx * v, py, pz + tz * u + nz * v]; }
+        var a = pt(-0.55 * L, -W), b = pt(0.16 * L, -W), c2 = pt(0.16 * L, W), d = pt(-0.55 * L, W);
+        var e = pt(0.16 * L, -1.15 * W), f = pt(0.52 * L, 0), g = pt(0.16 * L, 1.15 * W);
+        function put(v3, al) {
+          arwVB[o++] = v3[0]; arwVB[o++] = v3[1]; arwVB[o++] = v3[2];
+          arwVB[o++] = col[0]; arwVB[o++] = col[1]; arwVB[o++] = col[2]; arwVB[o++] = al;
+        }
+        put(a, 0.45 * fade); put(b, 0.45 * fade); put(c2, 0.75 * fade);   // 箭身：尾暗头亮，暗示行进
+        put(a, 0.45 * fade); put(c2, 0.75 * fade); put(d, 0.75 * fade);
+        put(e, 0.95 * fade); put(f, 0.95 * fade); put(g, 0.95 * fade);   // 箭头
+      }
+    });
+  }
+
+  function drawArrows(mvp) {
+    gl.useProgram(progA);
+    gl.uniformMatrix4fv(UA.uMVP, false, mvp);
+    gl.bindBuffer(gl.ARRAY_BUFFER, bArw);
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, arwVB);
+    gl.enableVertexAttribArray(AA.aPos);
+    gl.vertexAttribPointer(AA.aPos, 3, gl.FLOAT, false, 7 * 4, 0);
+    gl.enableVertexAttribArray(AA.aColor);
+    gl.vertexAttribPointer(AA.aColor, 4, gl.FLOAT, false, 7 * 4, 12);
+    gl.drawArrays(gl.TRIANGLES, 0, ARW_N * 9);
   }
 
   // ================= 相机 & 交互 =================
@@ -1224,6 +1328,9 @@ void main(){
     var simDt = paused ? 0 : dt;
     var qScale = timeFlow * (0.55 + 0.9 * Q_IN / 5000);
     updateParticles(simDt, timeFlow === 0 ? 0 : qScale);
+    var arrowsOn = document.getElementById('arrows').checked;
+    if (arrowsOn) updateArrows(simDt, timeFlow === 0 ? 0 : qScale);
+    buildArrows();
 
     var cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
     var eye = [TARGET[0] + cam.dist * cp * Math.sin(cam.yaw),
@@ -1242,6 +1349,7 @@ void main(){
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
     drawWater(mvp, t / 1000);                 // 连续水面 + 流动波光
     if (document.getElementById('section').checked) drawSection(mvp, t / 1000);
+    if (arrowsOn) drawArrows(mvp);            // 顺流漂移的流向箭头
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
     drawTrails(mvp);                          // 示踪拖尾
     drawParticles(mvp);                       // 发光粒子叠在水面上
