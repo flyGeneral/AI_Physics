@@ -1,0 +1,9 @@
+# macOS 本地生成
+.DS_Store
+.AppleDouble
+.LSOverride
+._
+
+# Windows
+Thumbs.db
+Desktop.ini
